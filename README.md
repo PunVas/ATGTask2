@@ -4,7 +4,7 @@ A Streamlit app that lets you upload a PDF and ask questions about its content �
 
 ---
 
-##What It Does
+## What It Does
 
 * **Upload a PDF** — and we’ll extract both the text and the images from it.
 * **Generate embeddings** — text via `SentenceTransformer`, images via `CLIP`.
