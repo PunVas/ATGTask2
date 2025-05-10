@@ -90,6 +90,3 @@ http://localhost:11434
 
 And it needs a model that can handle image input — like `llava`. If you're using something else, make sure it supports multimodal inputs.
 
----
-
-Let me know if you'd like a version tailored for deployment (e.g., on Hugging Face Spaces or Docker)!
