@@ -1,14 +1,10 @@
-This README-style documentation looks quite solid and user-friendly. To further humanize it and make it feel a bit more like what a developer might naturally jot down (including helpful reminders and a touch of informal tone), here’s a lightly "humanized" version of the same content:
-
----
-
-# 🧠 Multimodal RAG App
+# Multimodal RAG App
 
 A Streamlit app that lets you upload a PDF and ask questions about its content — text *and* images — using a multimodal RAG (Retrieval-Augmented Generation) setup. It uses Ollama (with LLaVA) behind the scenes to do the smart answering.
 
 ---
 
-## ✨ What It Does
+##What It Does
 
 * **Upload a PDF** — and we’ll extract both the text and the images from it.
 * **Generate embeddings** — text via `SentenceTransformer`, images via `CLIP`.
@@ -20,7 +16,7 @@ A Streamlit app that lets you upload a PDF and ask questions about its content �
 
 ---
 
-## 🧰 Prerequisites
+## Prerequisites
 
 Before you run the app, make sure you have the following ready:
 
@@ -31,7 +27,7 @@ Before you run the app, make sure you have the following ready:
 
 ---
 
-## 🚀 Setup
+## Setup
 
 1. **Save the app**
    Drop the Python code into a file, e.g., `app.py`.
@@ -59,7 +55,7 @@ Before you run the app, make sure you have the following ready:
 
 ---
 
-## 🏃‍♂️ How to Run the App
+## How to Run the App
 
 From your terminal:
 
@@ -71,7 +67,7 @@ It should pop open in your browser automatically.
 
 ---
 
-## 🕹️ How to Use It
+## How to Use It
 
 1. **Upload a PDF** from the sidebar.
 2. **Click "Process"** — give it a second to extract everything.
@@ -84,7 +80,7 @@ It should pop open in your browser automatically.
 
 ---
 
-## 🔌 Notes on Ollama
+## Notes on Ollama
 
 This app expects your Ollama server to be accessible at:
 
