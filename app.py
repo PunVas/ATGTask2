@@ -3,7 +3,7 @@ import os
 import tempfile
 import base64
 import requests
-import fitz
+import fitz  # for working with PDFs
 from PIL import Image
 import numpy as np
 import faiss
@@ -11,184 +11,225 @@ import torch
 from sentence_transformers import SentenceTransformer
 from transformers import CLIPProcessor, CLIPModel
 
+# Cache the models so we don't reload every time
 @st.cache_resource
-def load_models():
-    text_model = SentenceTransformer("all-MiniLM-L6-v2")
-    clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-    clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-    return text_model, clip_model, clip_processor
+def get_models():
+    txt_model = SentenceTransformer("all-MiniLM-L6-v2")  # small and quick enough
+    clip_mdl = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+    clip_proc = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+    return txt_model, clip_mdl, clip_proc
 
-def encode_image(image_path):
-    with open(image_path, "rb") as f:
+# Just reads image and base64s it for API
+def image_to_base64(img_path):
+    with open(img_path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
 
-def query_ollama(model, prompt, images=None, system=None):
-    url = "http://localhost:11434/api/generate"
-    data = {"model": model, "prompt": prompt, "stream": False}
-    if images:
-        data["images"] = images
-    if system:
-        data["system"] = system
-    response = requests.post(url, json=data)
-    return response.json().get("response", "") if response.ok else "[Error in response]"
+# Not fancy error handling here — maybe wrap later
+def ask_ollama(model_name, user_prompt, img_data=None, system_msg=None):
+    payload = {
+        "model": model_name,
+        "prompt": user_prompt,
+        "stream": False
+    }
+    if img_data:
+        payload["images"] = img_data
+    if system_msg:
+        payload["system"] = system_msg
+    try:
+        res = requests.post("http://localhost:11434/api/generate", json=payload)
+        return res.json().get("response", "") if res.ok else "[Error from Ollama]"
+    except Exception as e:
+        return f"[Request failed: {str(e)}]"
 
-def extract_content(pdf_path, text_embedder, clip_model, clip_processor):
-    doc = fitz.open(pdf_path)
-    text_chunks, text_embeds, image_paths, image_embeds = [], [], [], []
-    for i, page in enumerate(doc):
-        text = page.get_text().strip()
-        if text:
-            text_chunks.append((i, text))
-            embed = text_embedder.encode(text, normalize_embeddings=True)
-            text_embeds.append(embed)
-        for img_index, img in enumerate(page.get_images(full=True)):
-            xref = img[0]
-            base_image = doc.extract_image(xref)
-            img_bytes = base_image["image"]
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-                tmp.write(img_bytes)
-                path = tmp.name
-            image_paths.append({"path": path, "page": i + 1})
+# Go through each page of PDF and get the text + images
+def parse_pdf(pdf_file_path, embedder, clip_net, processor):
+    pdf = fitz.open(pdf_file_path)
+    chunks, chunk_vecs = [], []
+    img_meta, img_vecs = [], []
+
+    for pg_num, pg in enumerate(pdf):
+        txt = pg.get_text().strip()
+        if txt:
+            chunks.append((pg_num, txt))
+            vec = embedder.encode(txt, normalize_embeddings=True)
+            chunk_vecs.append(vec)
+
+        for i, im in enumerate(pg.get_images(full=True)):
+            xref = im[0]
+            raw_img = pdf.extract_image(xref)["image"]
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_img:
+                tmp_img.write(raw_img)
+                img_path = tmp_img.name
+
+            img_meta.append({"path": img_path, "page": pg_num + 1})
             try:
-                image = Image.open(path).convert("RGB")
-                inputs = clip_processor(images=image, return_tensors="pt")
+                img_obj = Image.open(img_path).convert("RGB")
+                inputs = processor(images=img_obj, return_tensors="pt")
                 with torch.no_grad():
-                    emb = clip_model.get_image_features(**inputs)
-                    emb = torch.nn.functional.normalize(emb, p=2, dim=-1)
-                    image_embeds.append(emb.squeeze().numpy())
-            except Exception as e:
-                print(f"Error processing image on page {i+1}, index {img_index}: {e}")
+                    out = clip_net.get_image_features(**inputs)
+                    norm_out = torch.nn.functional.normalize(out, p=2, dim=-1)
+                    img_vecs.append(norm_out.squeeze().numpy())
+            except Exception as ex:
+                print(f"Img error on page {pg_num + 1} idx {i}: {ex}")
             finally:
-                if os.path.exists(path):
-                    os.remove(path)
-    return text_chunks, text_embeds, image_paths, image_embeds
+                if os.path.exists(img_path):
+                    os.remove(img_path)
 
-def retrieve_relevant(query, text_embedder, clip_model, clip_processor, text_chunks, text_embeddings, image_paths, image_embeddings, top_k=3):
-    relevant_texts = []
-    relevant_images = []
-    if text_embeddings:
-        query_vec_text = text_embedder.encode(query, normalize_embeddings=True)
-        text_embs = np.array(text_embeddings)
-        if len(text_embs.shape) == 1:
-            text_embs = text_embs.reshape(1, -1)
-        elif len(text_embs.shape) > 2:
-            text_embs = text_embs.reshape(-1, text_embs.shape[-1])
-        if text_embs.shape[0] > 0:
-            text_index = faiss.IndexFlatIP(text_embs.shape[1])
-            text_index.add(text_embs)
-            D_text, I_text = text_index.search(np.array([query_vec_text]), top_k)
-            relevant_texts = [text_chunks[i][1] for i in I_text[0]]
-    if image_embeddings:
-        query_vec_image_inputs = clip_processor(text=[query], return_tensors="pt")
+    return chunks, chunk_vecs, img_meta, img_vecs
+
+# Helper to fetch relevant items using FAISS
+def find_matches(query_text, embedder, clip_net, processor, all_chunks, chunk_vecs, imgs, img_vecs, top_k=3):
+    found_texts = []
+    found_imgs = []
+
+    if chunk_vecs:
+        qv_text = embedder.encode(query_text, normalize_embeddings=True)
+        text_arr = np.array(chunk_vecs)
+        if len(text_arr.shape) == 1:
+            text_arr = text_arr.reshape(1, -1)
+        elif len(text_arr.shape) > 2:
+            text_arr = text_arr.reshape(-1, text_arr.shape[-1])
+        if text_arr.size:
+            index = faiss.IndexFlatIP(text_arr.shape[1])
+            index.add(text_arr)
+            _, idxs = index.search(np.array([qv_text]), top_k)
+            found_texts = [all_chunks[i][1] for i in idxs[0]]
+
+    if img_vecs:
+        clip_inputs = processor(text=[query_text], return_tensors="pt")
         with torch.no_grad():
-            query_vec_image = clip_model.get_text_features(**query_vec_image_inputs).squeeze().numpy()
-            query_vec_image = query_vec_image / np.linalg.norm(query_vec_image)
-        image_embs = np.array(image_embeddings)
-        if len(image_embs) > 0:
-            if len(image_embs.shape) == 1:
-                image_embs = image_embs.reshape(1, -1)
-            elif len(image_embs.shape) > 2:
-                image_embs = image_embs.reshape(-1, image_embs.shape[-1])
-            embedding_dimension = image_embs.shape[1]
-            image_index = faiss.IndexFlatIP(embedding_dimension)
-            image_index.add(image_embs)
-            D_image, I_image = image_index.search(np.array([query_vec_image]), min(top_k, image_embs.shape[0]))
-            relevant_images = [image_paths[i] for i in I_image[0]]
-    return relevant_texts, relevant_images
+            img_query_vec = clip_net.get_text_features(**clip_inputs).squeeze().numpy()
+            img_query_vec /= np.linalg.norm(img_query_vec)
+        img_arr = np.array(img_vecs)
+        if img_arr.size:
+            if len(img_arr.shape) == 1:
+                img_arr = img_arr.reshape(1, -1)
+            elif len(img_arr.shape) > 2:
+                img_arr = img_arr.reshape(-1, img_arr.shape[-1])
+            faiss_idx = faiss.IndexFlatIP(img_arr.shape[1])
+            faiss_idx.add(img_arr)
+            _, matched = faiss_idx.search(np.array([img_query_vec]), min(top_k, len(img_arr)))
+            found_imgs = [imgs[i] for i in matched[0]]
 
-def process_query(query, text_embedder, clip_model, clip_processor, text_chunks, text_embeddings, image_paths, image_embeddings):
-    retrieved_texts, retrieved_images = retrieve_relevant(query, text_embedder, clip_model, clip_processor, text_chunks, text_embeddings, image_paths, image_embeddings)
-    used_imgs = retrieved_images
-    joined_texts = "\n\n".join(retrieved_texts)
-    base64_images = [encode_image(img["path"]) for img in retrieved_images if os.path.exists(img["path"])]
-    prompt = f"""Question: {query}\n\nDocument Text Content:\n{joined_texts}\n\nConsider the attached images as context. Use both text and image content."""
+    return found_texts, found_imgs
+
+# Main logic to process user input and call backend
+def handle_query(q, embedder, clip_net, processor, txt_chunks, txt_embs, img_info, img_embs):
+    matched_txts, matched_imgs = find_matches(q, embedder, clip_net, processor, txt_chunks, txt_embs, img_info, img_embs)
+    # image paths are no longer available once deleted, so we re-encode
+    b64_imgs = [image_to_base64(i["path"]) for i in matched_imgs if os.path.exists(i["path"])]
+
+    prompt_text = f"""Question: {q}
+
+Document Text Content:
+{'\n\n'.join(matched_txts)}
+
+Consider the attached images as context. Use both text and image content."""
     system_msg = "You are a helpful assistant that answers questions about documents using provided text and images."
-    response = query_ollama("llava", prompt, images=base64_images, system=system_msg)
-    return response, used_imgs
 
-st.set_page_config(page_title="Multimodal RAG", page_icon="🔥", layout="wide")
-st.title("Multimodal RAG App")
-st.markdown("Upload a PDF and ask questions about its content")
+    reply = ask_ollama("llava", prompt_text, images=b64_imgs, system_msg=system_msg)
+    return reply, matched_imgs
 
-text_embedder, clip_model, clip_processor = load_models()
+# --- UI Starts Here ---
 
-if "documents" not in st.session_state:
-    st.session_state["documents"] = []
-if "text_chunks" not in st.session_state:
-    st.session_state["text_chunks"] = []
-if "text_embeddings" not in st.session_state:
-    st.session_state["text_embeddings"] = []
-if "image_paths" not in st.session_state:
-    st.session_state["image_paths"] = []
-if "image_embeddings" not in st.session_state:
-    st.session_state["image_embeddings"] = []
-if "chat_history" not in st.session_state:
-    st.session_state["chat_history"] = []
+st.set_page_config(page_title="Multimodal RAG", page_icon="📄", layout="wide")
+st.title("📚 Ask Your PDF")
+st.markdown("Upload a PDF and then ask questions about what's inside. Works with both text and images.")
 
+text_embedder, clip_model, clip_processor = get_models()
+
+# Initialize session state if needed
+for key in ["documents", "text_chunks", "text_embeddings", "image_paths", "image_embeddings", "chat_history"]:
+    if key not in st.session_state:
+        st.session_state[key] = []
+
+# Sidebar upload section
 with st.sidebar:
-    st.header("Upload Document")
-    file = st.file_uploader("Upload PDF", type="pdf")
-    if file and st.button("Process"):
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(file.getvalue())
-            path = tmp.name
-        with st.spinner("Extracting content and computing embeddings..."):
-            tc, te, ip, ie = extract_content(path, text_embedder, clip_model, clip_processor)
-            st.session_state.text_chunks = tc
-            st.session_state.text_embeddings = te
-            st.session_state.image_paths = ip
-            st.session_state.image_embeddings = ie
-            st.session_state.documents = [file]
-            st.success("Document processed.")
+    st.header("📤 Upload PDF")
+    file = st.file_uploader("Choose your PDF", type="pdf")
+    if file and st.button("📄 Process PDF"):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmpf:
+            tmpf.write(file.getvalue())
+            temp_path = tmpf.name
 
-st.header("Sawal poocho")
-query = st.text_input("Your question")
-if query and st.button("Submit"):
+        with st.spinner("Extracting and embedding..."):
+            t_chunks, t_embs, i_paths, i_embs = parse_pdf(temp_path, text_embedder, clip_model, clip_processor)
+            st.session_state.text_chunks = t_chunks
+            st.session_state.text_embeddings = t_embs
+            st.session_state.image_paths = i_paths
+            st.session_state.image_embeddings = i_embs
+            st.session_state.documents = [file]
+        st.success("Done! You can now ask questions.")
+
+# Main interaction block
+st.header("Ask Something")
+user_query = st.text_input("Your question:")
+if user_query and st.button("🔍 Get Answer"):
     if st.session_state.text_embeddings and st.session_state.image_embeddings:
-        with st.spinner("Generating response..."):
-            response, used_imgs = process_query(query, text_embedder, clip_model, clip_processor, st.session_state.text_chunks, st.session_state.text_embeddings, st.session_state.image_paths, st.session_state.image_embeddings)
+        with st.spinner("Thinking..."):
+            reply_text, images_used = handle_query(user_query, text_embedder, clip_model, clip_processor,
+                                                   st.session_state.text_chunks, st.session_state.text_embeddings,
+                                                   st.session_state.image_paths, st.session_state.image_embeddings)
+
+            # Check if we already asked this one
             found = False
-            for item in st.session_state.chat_history:
-                if item['query'] == query:
-                    item['responses'].append({'response': response, 'images': used_imgs, 'feedback': None, 'regenerated': False})
+            for entry in st.session_state.chat_history:
+                if entry['query'] == user_query:
+                    entry['responses'].append({
+                        'response': reply_text,
+                        'images': images_used,
+                        'feedback': None,
+                        'regenerated': False
+                    })
                     found = True
                     break
             if not found:
-                st.session_state.chat_history.append({'query': query, 'responses': [{'response': response, 'images': used_imgs, 'feedback': None, 'regenerated': False}]})
+                st.session_state.chat_history.append({
+                    'query': user_query,
+                    'responses': [{
+                        'response': reply_text,
+                        'images': images_used,
+                        'feedback': None,
+                        'regenerated': False
+                    }]
+                })
     else:
-        st.warning("Please upload and process a document first.")
+        st.warning("You need to upload and process a document first!")
 
-for i, exch in enumerate(st.session_state.chat_history):
-    st.subheader(f"Q: {exch['query']}")
-    for response_index, response_data in enumerate(exch['responses']):
-        st.write(response_data['response'])
-        if response_data.get("images"):
+# Display past Q&A
+for idx, chat in enumerate(st.session_state.chat_history):
+    st.subheader(f"Q: {chat['query']}")
+    for ridx, resp in enumerate(chat['responses']):
+        st.write(resp['response'])
+        if resp.get("images"):
             st.subheader("Images Used:")
-            cols = st.columns(min(3, len(response_data["images"])))
-            for j, img in enumerate(response_data["images"]):
+            cols = st.columns(min(3, len(resp["images"])))
+            for j, img in enumerate(resp["images"]):
                 with cols[j % len(cols)]:
                     if os.path.exists(img["path"]):
                         st.image(img["path"], caption=f"Page {img['page']}", use_column_width=True)
-        feedback_key = f"fb_{i}_{response_index}"
-        feedback = st.radio(f"Was this helpful?", ["👍", "👎"], horizontal=True, key=feedback_key, index=0)
+        feedback_key = f"fb_{idx}_{ridx}"
+        fb = st.radio("Helpful?", ["👍", "👎"], key=feedback_key, horizontal=True, index=0)
 
-        if feedback == "👎" and not response_data.get('regenerated', False) and st.session_state.get(f"regenerate_{i}_{response_index}", False) is False:
-            with st.spinner("Regenerating response..."):
-                new_response, new_used_imgs = process_query(exch['query'], text_embedder, clip_model, clip_processor, st.session_state.text_chunks, st.session_state.text_embeddings, st.session_state.image_paths, st.session_state.image_embeddings)
-                exch['responses'].append({'response': new_response, 'images': new_used_imgs, 'feedback': None, 'regenerated': True})
-                st.session_state[f"regenerate_{i}_{response_index}"] = True
+        if fb == "👎" and not resp.get("regenerated", False) and not st.session_state.get(f"regenerate_{idx}_{ridx}", False):
+            with st.spinner("Trying again..."):
+                retry_ans, retry_imgs = handle_query(chat['query'], text_embedder, clip_model, clip_processor,
+                                                     st.session_state.text_chunks, st.session_state.text_embeddings,
+                                                     st.session_state.image_paths, st.session_state.image_embeddings)
+                chat['responses'].append({'response': retry_ans, 'images': retry_imgs, 'feedback': None, 'regenerated': True})
+                st.session_state[f"regenerate_{idx}_{ridx}"] = True
                 st.rerun()
 
-        if feedback:
-            exch['responses'][response_index]['feedback'] = feedback
-            with open("feedback_log.txt", "a", encoding="utf-8") as f:
-                f.write(f"{exch['query']}\t{response_data['response']}\t{feedback}\n")
-            st.success("Thank you for your feedback!", icon="✅")
+        if fb:
+            resp['feedback'] = fb
+            with open("feedback_log.txt", "a", encoding="utf-8") as log:
+                log.write(f"{chat['query']}\t{resp['response']}\t{fb}\n")
+            st.success("Thanks for the feedback!", icon="✅")
 
     st.divider()
 
-with st.expander("Document Info"):
+with st.expander("📝 PDF Info"):
     if st.session_state.documents:
         st.write("Uploaded:", st.session_state.documents[0].name)
-        st.write("Total Images:", len(st.session_state.image_paths))
-        st.write("Total Text Chunks:", len(st.session_state.text_chunks))
+        st.write("Text chunks:", len(st.session_state.text_chunks))
+        st.write("Images found:", len(st.session_state.image_paths))
